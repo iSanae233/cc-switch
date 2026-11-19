@@ -61,6 +61,7 @@ import {
   pluginMarketplacesQuery,
   pluginPatches,
   prefetchInstalledOnce,
+  recoverPluginReads,
   usePluginWrites,
 } from "@/hooks/usePlugins";
 import {
@@ -70,6 +71,7 @@ import {
   PLUGIN_CLI_NOT_INSTALLED,
   PLUGIN_LOGIN_COMMAND,
   PLUGIN_NEEDS_TERMINAL_CONFIRM,
+  isPluginCliReadError,
   pluginsApi,
   type PluginActionOutcome,
   type PluginApp,
@@ -198,10 +200,12 @@ export function PluginsPage({ apps, initialApp }: PluginsPageProps) {
   // 已安装和目录同时起：已安装那条便宜，先回来先显示
   const installedQuery = useQuery(installedPluginsQuery(app));
   const catalogQuery = useQuery(pluginCatalogQuery(app));
-  const marketplaces = useQuery({
-    ...pluginMarketplacesQuery(app),
-    enabled: features.marketplaces && (view === "marketplaces" || addOpen),
-  });
+  const marketplaces = useQuery(
+    pluginMarketplacesQuery(
+      app,
+      features.marketplaces && (view === "marketplaces" || addOpen),
+    ),
+  );
 
   // 其它应用的已安装列表先在后台读好，切过去不用等
   useEffect(() => {
@@ -291,6 +295,7 @@ export function PluginsPage({ apps, initialApp }: PluginsPageProps) {
       {
         key: entry.id,
         action: "install",
+        requiresCli: app === "codex",
         task: () => pluginsApi.install(app, entry.id),
         // 安装要联网、可能失败，不先挪；装好立即放进已安装，版本等对账时补齐
         onSuccess: pluginPatches.add(installedFromCatalog(app, entry)),
@@ -342,6 +347,7 @@ export function PluginsPage({ apps, initialApp }: PluginsPageProps) {
       {
         key: entry.id,
         action: "update",
+        requiresCli: app === "codex",
         task: () => pluginsApi.update(app, entry.id),
         reconcile: ["installed"],
       },
@@ -367,6 +373,7 @@ export function PluginsPage({ apps, initialApp }: PluginsPageProps) {
       {
         key: entry.id,
         action: "uninstall",
+        requiresCli: app === "codex",
         task: () => pluginsApi.uninstall(app, entry.id),
         optimistic: {
           apply: pluginPatches.remove(entry),
@@ -390,6 +397,7 @@ export function PluginsPage({ apps, initialApp }: PluginsPageProps) {
       {
         key: "market:*",
         action: "refresh",
+        requiresCli: app === "codex",
         task: () => pluginsApi.refreshMarketplaces(app),
         reconcile: ["catalog", "marketplaces", "installed"],
       },
@@ -406,6 +414,7 @@ export function PluginsPage({ apps, initialApp }: PluginsPageProps) {
       {
         key: "market:+",
         action: "add",
+        requiresCli: app === "codex",
         task: () => pluginsApi.addMarketplace(app, trimmed),
         reconcile: ["catalog", "marketplaces"],
       },
@@ -426,6 +435,7 @@ export function PluginsPage({ apps, initialApp }: PluginsPageProps) {
       {
         key: `market:${market.name}`,
         action: "remove",
+        requiresCli: app === "codex",
         task: () => pluginsApi.removeMarketplace(app, market.name),
         reconcile: ["catalog", "marketplaces", "installed"],
       },
@@ -438,9 +448,40 @@ export function PluginsPage({ apps, initialApp }: PluginsPageProps) {
       },
     );
 
+  const readErrorDetail = (error: unknown) => {
+    if (!isPluginCliReadError(error)) {
+      return extractErrorMessage(error) || String(error);
+    }
+    return [
+      error.missingCodexDependency ? t("pluginsPage.cliRepair") : null,
+      error.executable
+        ? t("pluginsPage.cliPath", { path: error.executable })
+        : null,
+      error.exitCode !== null
+        ? t("pluginsPage.cliExitCode", { code: error.exitCode })
+        : null,
+      error.message,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  };
+
+  const retryRead = async (error: unknown, fetch: () => Promise<unknown>) => {
+    try {
+      // The caller fetches by key, even if the page switches to a different app.
+      await fetch();
+    } catch {
+      // The query already exposes the failed retry to the error panel.
+      return;
+    }
+    if (isPluginCliReadError(error) && error.missingCodexDependency) {
+      await recoverPluginReads(queryClient, app);
+    }
+  };
+
   const anyBusy = Object.keys(busy).length > 0;
   const loadError = installedQuery.isError
-    ? extractErrorMessage(installedQuery.error) || String(installedQuery.error)
+    ? readErrorDetail(installedQuery.error)
     : null;
   const cliMissing = loadError === PLUGIN_CLI_NOT_INSTALLED;
   const loaded = installedQuery.data !== undefined && loadError === null;
@@ -597,7 +638,14 @@ export function PluginsPage({ apps, initialApp }: PluginsPageProps) {
               type="button"
               variant="neutral"
               size="regular"
-              onClick={() => void installedQuery.refetch()}
+              onClick={() =>
+                void retryRead(installedQuery.error, () =>
+                  queryClient.fetchQuery({
+                    ...installedPluginsQuery(app),
+                    staleTime: 0,
+                  }),
+                )
+              }
             >
               {t("common.retry")}
             </Button>
@@ -606,20 +654,29 @@ export function PluginsPage({ apps, initialApp }: PluginsPageProps) {
       );
     }
     if (view === "marketplaces") return renderMarketplaces();
-    if (view === "discover" && !catalogReady) {
+    if (
+      view === "discover" &&
+      (!catalogReady ||
+        (isPluginCliReadError(catalogQuery.error) &&
+          catalogQuery.error.missingCodexDependency))
+    ) {
       return catalogQuery.isError ? (
         <CenteredState
           title={t("pluginsPage.catalogLoadFailed")}
-          detail={
-            extractErrorMessage(catalogQuery.error) ||
-            String(catalogQuery.error)
-          }
+          detail={readErrorDetail(catalogQuery.error)}
           action={
             <Button
               type="button"
               variant="neutral"
               size="regular"
-              onClick={() => void catalogQuery.refetch()}
+              onClick={() =>
+                void retryRead(catalogQuery.error, () =>
+                  queryClient.fetchQuery({
+                    ...pluginCatalogQuery(app),
+                    staleTime: 0,
+                  }),
+                )
+              }
             >
               {t("common.retry")}
             </Button>
@@ -753,16 +810,20 @@ export function PluginsPage({ apps, initialApp }: PluginsPageProps) {
       return (
         <CenteredState
           title={t("pluginsPage.marketsLoadFailed")}
-          detail={
-            extractErrorMessage(marketplaces.error) ||
-            String(marketplaces.error)
-          }
+          detail={readErrorDetail(marketplaces.error)}
           action={
             <Button
               type="button"
               variant="neutral"
               size="regular"
-              onClick={() => void marketplaces.refetch()}
+              onClick={() =>
+                void retryRead(marketplaces.error, () =>
+                  queryClient.fetchQuery({
+                    ...pluginMarketplacesQuery(app, true),
+                    staleTime: 0,
+                  }),
+                )
+              }
             >
               {t("common.retry")}
             </Button>

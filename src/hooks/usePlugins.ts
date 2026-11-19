@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { readLocalCache, writeLocalCache } from "@/lib/localCache";
 import {
+  isPluginCliReadError,
   pluginsApi,
   type PluginActionOutcome,
   type PluginApp,
@@ -29,7 +30,10 @@ const installedCacheKey = (app: PluginApp) => `plugins:${app}:installed`;
 
 /** 每个应用进行中的写操作数，和操作结束后要重读的查询。 */
 const pending = new Map<PluginApp, number>();
-const reconcileTargets = new Map<PluginApp, Set<ReconcileTarget>>();
+const reconcileTargets = new Map<
+  PluginApp,
+  { targets: Set<ReconcileTarget>; cliRecovered: boolean }
+>();
 
 export const hasPendingPluginWrites = (app: PluginApp) =>
   (pending.get(app) ?? 0) > 0;
@@ -47,11 +51,63 @@ export function resetPluginWriteState() {
 /** 有写操作在跑时不自动刷新：刷新读到的是操作前的状态，会把乐观结果盖回去。 */
 const idleOnly = (app: PluginApp) => () => !hasPendingPluginWrites(app);
 
+// A missing platform package requires repair outside CC Switch. Disabling
+// automatic fetches still allows the error panel's explicit refetch().
+const canReadPlugins = ({ state }: { state: { error: unknown } }) =>
+  !needsCliRepair(state.error);
+
+function needsCliRepair(error: unknown) {
+  return isPluginCliReadError(error) && error.missingCodexDependency;
+}
+
+const readTargets = ["installed", "catalog", "marketplaces"] as const;
+
+function refreshReadAfterRepair(
+  queryClient: QueryClient,
+  queryKey: readonly unknown[],
+) {
+  const query = queryClient.getQueryCache().find({ queryKey, exact: true });
+  if (
+    query &&
+    (needsCliRepair(query.state.error) ||
+      query.state.fetchStatus === "fetching")
+  ) {
+    // An in-flight read may still be using the old CLI or pre-write state.
+    // The explicit fetch bypasses the automatic guard and keeps cached data.
+    return queryClient
+      .cancelQueries({ queryKey, exact: true })
+      .then(() => query.fetch())
+      .catch(() => {
+        // The query retains the error for its own panel.
+      });
+  }
+}
+
+export function recoverPluginReads(queryClient: QueryClient, app: PluginApp) {
+  if (app !== "codex") return;
+  if (hasPendingPluginWrites(app)) {
+    const reconciliation = reconcileTargets.get(app) ?? {
+      targets: new Set<ReconcileTarget>(),
+      cliRecovered: false,
+    };
+    reconciliation.cliRecovered = true;
+    reconcileTargets.set(app, reconciliation);
+    return;
+  }
+  return Promise.all(
+    readTargets.map((target) =>
+      refreshReadAfterRepair(queryClient, pluginKeys[target](app)),
+    ),
+  );
+}
+
 export const installedPluginsQuery = (app: PluginApp) => ({
   queryKey: pluginKeys.installed(app),
-  queryFn: async () => {
+  queryFn: async (context: { signal: AbortSignal }) => {
     const result = await pluginsApi.listInstalled(app);
-    if (!hasPendingPluginWrites(app)) {
+    // Read the signal after IPC finishes. TanStack aborts on unmount if
+    // the signal is consumed earlier, but IPC can complete across navigation.
+    if (!context.signal.aborted && !hasPendingPluginWrites(app)) {
       writeLocalCache(installedCacheKey(app), result);
     }
     return result;
@@ -61,6 +117,7 @@ export const installedPluginsQuery = (app: PluginApp) => ({
   initialDataUpdatedAt: 0,
   staleTime: 15_000,
   retry: false,
+  enabled: canReadPlugins,
   refetchOnMount: idleOnly(app),
   // 用户可能在终端里用 CLI 改过：切回窗口时重读（便宜的那条）
   refetchOnWindowFocus: idleOnly(app),
@@ -74,7 +131,8 @@ export function prefetchInstalledOnce(
   queryClient: QueryClient,
   app: PluginApp,
 ) {
-  if (prefetched.has(app)) return;
+  const state = queryClient.getQueryState(pluginKeys.installed(app));
+  if (prefetched.has(app) || (state && !canReadPlugins({ state }))) return;
   prefetched.add(app);
   void queryClient.prefetchQuery(installedPluginsQuery(app));
 }
@@ -84,14 +142,17 @@ export const pluginCatalogQuery = (app: PluginApp) => ({
   queryFn: () => pluginsApi.listCatalog(app),
   staleTime: 5 * 60_000,
   retry: false,
+  enabled: canReadPlugins,
   refetchOnWindowFocus: false,
 });
 
-export const pluginMarketplacesQuery = (app: PluginApp) => ({
+export const pluginMarketplacesQuery = (app: PluginApp, visible: boolean) => ({
   queryKey: pluginKeys.marketplaces(app),
   queryFn: () => pluginsApi.listMarketplaces(app),
   staleTime: 60_000,
   retry: false,
+  enabled: (query: Parameters<typeof canReadPlugins>[0]) =>
+    visible && canReadPlugins(query),
   refetchOnWindowFocus: false,
 });
 
@@ -162,6 +223,7 @@ interface PluginWrite {
   onSuccess?: InstalledPatch;
   /** 操作结束后要在后台重读的查询 */
   reconcile: ReconcileTarget[];
+  requiresCli?: boolean;
 }
 
 function patchInstalled(
@@ -178,20 +240,30 @@ function finishWrite(
   queryClient: QueryClient,
   app: PluginApp,
   targets: ReconcileTarget[],
+  cliRecovered: boolean,
 ) {
-  const set = reconcileTargets.get(app) ?? new Set<ReconcileTarget>();
-  targets.forEach((t) => set.add(t));
-  reconcileTargets.set(app, set);
+  const reconciliation = reconcileTargets.get(app) ?? {
+    targets: new Set<ReconcileTarget>(),
+    cliRecovered: false,
+  };
+  targets.forEach((target) => reconciliation.targets.add(target));
+  reconciliation.cliRecovered ||= cliRecovered;
+  reconcileTargets.set(app, reconciliation);
   const left = (pending.get(app) ?? 1) - 1;
   pending.set(app, left);
   if (left > 0) return;
   // 最后一个操作结束：攒下的查询一起对一次账
   reconcileTargets.delete(app);
-  for (const target of set) {
-    void queryClient.invalidateQueries({
-      queryKey: pluginKeys[target](app),
-      exact: true,
-    });
+  for (const target of readTargets) {
+    const queryKey = pluginKeys[target](app);
+    if (
+      reconciliation.cliRecovered &&
+      refreshReadAfterRepair(queryClient, queryKey)
+    )
+      continue;
+    if (reconciliation.targets.has(target)) {
+      void queryClient.invalidateQueries({ queryKey, exact: true });
+    }
   }
 }
 
@@ -213,6 +285,7 @@ export function usePluginWrites(app: PluginApp) {
     async (write: PluginWrite): Promise<PluginWriteResult> => {
       pending.set(app, (pending.get(app) ?? 0) + 1);
       setBusy((prev) => ({ ...prev, [write.key]: write.action }));
+      let cliRecovered = false;
       try {
         if (write.optimistic) {
           // 正在跑的刷新读的是操作前的状态，晚到会把乐观结果盖掉
@@ -224,6 +297,7 @@ export function usePluginWrites(app: PluginApp) {
         }
         try {
           const outcome = await write.task();
+          cliRecovered = write.requiresCli === true;
           if (write.onSuccess)
             patchInstalled(queryClient, app, write.onSuccess);
           return { ok: true, outcome };
@@ -239,7 +313,7 @@ export function usePluginWrites(app: PluginApp) {
           delete next[write.key];
           return next;
         });
-        finishWrite(queryClient, app, write.reconcile);
+        finishWrite(queryClient, app, write.reconcile, cliRecovered);
       }
     },
     [app, queryClient],

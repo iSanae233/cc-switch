@@ -52,7 +52,11 @@ import {
   filterPlugins,
   withCatalogDetails,
 } from "@/components/plugins/PluginsPage";
-import { resetPluginWriteState } from "@/hooks/usePlugins";
+import {
+  installedPluginsQuery,
+  pluginKeys,
+  resetPluginWriteState,
+} from "@/hooks/usePlugins";
 
 const plugin = (over: Partial<PluginEntry> = {}): PluginEntry => ({
   id: "frontend-design@official",
@@ -494,6 +498,134 @@ describe("PluginsPage", () => {
     expect(screen.queryByText("common.retry")).not.toBeInTheDocument();
   });
 
+  it("keeps a broken Codex launcher visible on remount and recovers on Retry", async () => {
+    const error = {
+      missingCodexDependency: true,
+      message: "Missing optional dependency @openai/codex-darwin-arm64",
+      executable: "/opt/homebrew/bin/codex",
+      exitCode: 1,
+    };
+    m.listInstalled.mockRejectedValueOnce(error);
+    m.listCatalog.mockRejectedValueOnce(error);
+    const client = new QueryClient();
+    const page = (
+      <QueryClientProvider client={client}>
+        <PluginsPage apps={["codex"]} initialApp="codex" />
+      </QueryClientProvider>
+    );
+    const { rerender } = render(page);
+    expect(
+      await screen.findByText(/Missing optional dependency/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Missing optional dependency/)).toHaveTextContent(
+      "pluginsPage.cliPath",
+    );
+    expect(screen.getByText(/Missing optional dependency/)).toHaveTextContent(
+      "pluginsPage.cliExitCode",
+    );
+
+    rerender(<QueryClientProvider client={client}>{null}</QueryClientProvider>);
+    rerender(page);
+    expect(screen.getByText(/Missing optional dependency/)).toBeInTheDocument();
+    expect(m.listInstalled).toHaveBeenCalledTimes(1);
+    expect(m.listCatalog).toHaveBeenCalledTimes(1);
+
+    const repaired = deferred<PluginEntry[]>();
+    m.listInstalled.mockReturnValueOnce(repaired.promise);
+    await userEvent.click(screen.getByRole("button", { name: "common.retry" }));
+    rerender(<QueryClientProvider client={client}>{null}</QueryClientProvider>);
+    await act(async () => repaired.resolve([plugin()]));
+    rerender(page);
+    expect(await screen.findByText("frontend-design")).toBeInTheDocument();
+    await waitFor(() => expect(m.listCatalog).toHaveBeenCalledTimes(2));
+    expect(m.listInstalled).toHaveBeenCalledTimes(2);
+    expect(
+      screen.queryByText(/Missing optional dependency/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("offers Retry in Discover after a startup failure even with cached data", async () => {
+    const error = {
+      missingCodexDependency: true,
+      message: "Missing optional dependency @openai/codex-darwin-arm64",
+      executable: "/opt/homebrew/bin/codex",
+      exitCode: 1,
+    };
+    m.listCatalog.mockRejectedValueOnce(error);
+    m.listMarketplaces.mockRejectedValueOnce(error);
+    m.listCatalog.mockResolvedValue([
+      catalogItem({ id: "fresh@m", name: "fresh" }),
+    ]);
+    const client = new QueryClient();
+    const queryKey = pluginKeys.catalog("codex");
+    client.setQueryData(queryKey, [catalogItem()], { updatedAt: 1 });
+    render(
+      <QueryClientProvider client={client}>
+        <PluginsPage apps={["codex"]} initialApp="codex" />
+      </QueryClientProvider>,
+    );
+    await waitFor(() =>
+      expect(client.getQueryState(queryKey)?.status).toBe("error"),
+    );
+    await userEvent.click(
+      screen.getByRole("tab", { name: "pluginsPage.viewMarketplaces" }),
+    );
+    expect(
+      await screen.findByText(/Missing optional dependency/),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("tab", { name: "pluginsPage.viewDiscoverCount" }),
+    );
+    expect(
+      await screen.findByText(/Missing optional dependency/),
+    ).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "common.retry" }));
+    expect(await screen.findByText("fresh")).toBeInTheDocument();
+    expect(m.listCatalog).toHaveBeenCalledTimes(2);
+    await userEvent.click(
+      screen.getByRole("tab", { name: "pluginsPage.viewMarketplaces" }),
+    );
+    await waitFor(() => expect(m.listMarketplaces).toHaveBeenCalledTimes(2));
+    expect(
+      screen.queryByText(/Missing optional dependency/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not persist an obsolete installed list after cancellation", async () => {
+    const oldRead = deferred<PluginEntry[]>();
+    m.listInstalled.mockReturnValueOnce(oldRead.promise);
+    m.listInstalled.mockResolvedValueOnce([plugin({ name: "new list" })]);
+    const client = new QueryClient();
+    const options = installedPluginsQuery("codex");
+    const pending = client.fetchQuery(options).catch(() => undefined);
+    await client.cancelQueries({ queryKey: options.queryKey, exact: true });
+    await client.fetchQuery(options);
+    oldRead.resolve([plugin({ name: "old list" })]);
+    await oldRead.promise;
+    await pending;
+    const persisted = localStorage.getItem(
+      "cc-switch-cache:plugins:codex:installed",
+    );
+    expect(persisted).toContain("new list");
+    expect(persisted).not.toContain("old list");
+  });
+
+  it("retries a transient CLI failure when reopening the page", async () => {
+    m.listInstalled.mockRejectedValueOnce("Network unavailable");
+    const client = new QueryClient();
+    const page = (
+      <QueryClientProvider client={client}>
+        <PluginsPage apps={["codex"]} initialApp="codex" />
+      </QueryClientProvider>
+    );
+    const { rerender } = render(page);
+    expect(await screen.findByText("Network unavailable")).toBeInTheDocument();
+    rerender(<QueryClientProvider client={client}>{null}</QueryClientProvider>);
+    rerender(page);
+    expect(await screen.findByText("frontend-design")).toBeInTheDocument();
+    expect(m.listInstalled).toHaveBeenCalledTimes(2);
+  });
+
   it("prefetches the other app and switches to it", async () => {
     renderPage({ apps: ["claude", "codex"] });
     await screen.findByText("frontend-design");
@@ -555,6 +687,76 @@ describe("PluginsPage", () => {
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument(),
     );
     await waitFor(() => expect(m.listCatalog).toHaveBeenCalledTimes(2));
+  });
+
+  it("recovers plugin reads after adding a Codex marketplace", async () => {
+    const error = {
+      missingCodexDependency: true,
+      message: "Missing optional dependency @openai/codex-darwin-arm64",
+      executable: "/opt/homebrew/bin/codex",
+      exitCode: 1,
+    };
+    m.listCatalog.mockRejectedValueOnce(error);
+    m.listMarketplaces.mockRejectedValueOnce(error);
+    renderPage({ apps: ["codex"], initialApp: "codex" });
+    await screen.findByText("frontend-design");
+    await userEvent.click(
+      screen.getByRole("tab", { name: "pluginsPage.viewMarketplaces" }),
+    );
+    expect(
+      await screen.findByText(/Missing optional dependency/),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: "pluginsPage.addMarketplace" }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    await userEvent.type(within(dialog).getByRole("textbox"), "owner/market");
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "common.add" }),
+    );
+    await waitFor(() =>
+      expect(m.addMarketplace).toHaveBeenCalledWith("codex", "owner/market"),
+    );
+    await waitFor(() => expect(m.listCatalog).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(m.listMarketplaces).toHaveBeenCalledTimes(2));
+    expect(
+      screen.queryByText(/Missing optional dependency/),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the cached catalog when recovery encounters a transient error", async () => {
+    const error = {
+      missingCodexDependency: true,
+      message: "Missing optional dependency @openai/codex-darwin-arm64",
+      executable: "/opt/homebrew/bin/codex",
+      exitCode: 1,
+    };
+    m.listInstalled.mockRejectedValueOnce(error);
+    m.listCatalog
+      .mockRejectedValueOnce(error)
+      .mockRejectedValueOnce("Network unavailable");
+    const client = new QueryClient();
+    const queryKey = pluginKeys.catalog("codex");
+    client.setQueryData(queryKey, [superpowers], { updatedAt: 1 });
+    render(
+      <QueryClientProvider client={client}>
+        <PluginsPage apps={["codex"]} initialApp="codex" />
+      </QueryClientProvider>,
+    );
+    expect(
+      await screen.findByText(/Missing optional dependency/),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(client.getQueryState(queryKey)?.status).toBe("error"),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "common.retry" }));
+    await waitFor(() =>
+      expect(client.getQueryState(queryKey)?.error).toBe("Network unavailable"),
+    );
+    await userEvent.click(
+      screen.getByRole("tab", { name: "pluginsPage.viewDiscoverCount" }),
+    );
+    expect(await screen.findByText("superpowers")).toBeInTheDocument();
   });
 
   it("keeps the add dialog open when adding fails", async () => {

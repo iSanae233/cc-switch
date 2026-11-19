@@ -191,6 +191,19 @@ pub(crate) fn run_detected_tool_command_with_timeout(
     extra_env: &[(&str, String)],
     working_dir: &Path,
 ) -> Result<std::process::Output, String> {
+    run_detected_tool_command_with_path(tool, args, timeout, extra_env, working_dir)
+        .map(|(output, _)| output)
+}
+
+/// Return the native executable actually passed to the process runner.
+/// WSL resolves the executable inside the distribution.
+pub(crate) fn run_detected_tool_command_with_path(
+    tool: &str,
+    args: &[&str],
+    timeout: Option<std::time::Duration>,
+    extra_env: &[(&str, String)],
+    working_dir: &Path,
+) -> Result<(std::process::Output, Option<std::path::PathBuf>), String> {
     if known_tool(tool).is_none() {
         return Err(format!("Unsupported tool: {tool}"));
     }
@@ -202,7 +215,8 @@ pub(crate) fn run_detected_tool_command_with_timeout(
 
     #[cfg(target_os = "windows")]
     if let Some(distro) = wsl_distro_for_tool(tool) {
-        return run_wsl_tool_command(tool, args, &distro, deadline, extra_env, working_dir);
+        return run_wsl_tool_command(tool, args, &distro, deadline, extra_env, working_dir)
+            .map(|output| (output, None));
     }
 
     // Runtime execution only needs the default entry point. Full installation
@@ -229,7 +243,7 @@ pub(crate) fn run_detected_tool_command_with_timeout(
     };
 
     #[cfg(target_os = "windows")]
-    {
+    let output = {
         run_windows_tool_command_capture(
             &tool_path,
             args,
@@ -238,10 +252,10 @@ pub(crate) fn run_detected_tool_command_with_timeout(
             extra_env,
             working_dir,
         )
-    }
+    };
 
     #[cfg(not(target_os = "windows"))]
-    {
+    let output = {
         use std::process::{Command, Stdio};
 
         let mut cmd = Command::new(&tool_path);
@@ -258,7 +272,9 @@ pub(crate) fn run_detected_tool_command_with_timeout(
             .spawn()
             .map_err(|e| format!("Failed to run {tool}: {e}"))?;
         wait_child_output(child, deadline)
-    }
+    };
+
+    output.map(|output| (output, Some(tool_path)))
 }
 
 /// 构造运行本机工具默认入口的命令（定位规则和 PATH 补全同 [`run_detected_tool_command_with_timeout`]），

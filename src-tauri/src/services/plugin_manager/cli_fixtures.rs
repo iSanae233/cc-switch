@@ -20,6 +20,8 @@ fn json(text: &str) -> Value {
 
 fn ok(stdout: &str) -> CliOutput {
     CliOutput {
+        executable: None,
+        exit_code: None,
         success: true,
         stdout: stdout.to_string(),
         stderr: String::new(),
@@ -28,6 +30,8 @@ fn ok(stdout: &str) -> CliOutput {
 
 fn failed(stdout: &str, stderr: &str) -> CliOutput {
     CliOutput {
+        executable: None,
+        exit_code: None,
         success: false,
         stdout: stdout.to_string(),
         stderr: stderr.to_string(),

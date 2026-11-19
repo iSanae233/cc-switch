@@ -3,32 +3,35 @@
 //! 每条命令都会起一次 CLI 子进程，放到阻塞线程池里跑，不占 async 运行时。
 
 use crate::services::plugin_manager::{
-    self, PluginActionOutcome, PluginApp, PluginEntry, PluginMarketplace,
+    self, PluginActionOutcome, PluginApp, PluginEntry, PluginMarketplace, PluginReadError,
 };
 use crate::store::AppState;
 
-async fn blocking<T, F>(f: F) -> Result<T, String>
+async fn blocking<T, E, F>(f: F) -> Result<T, E>
 where
     T: Send + 'static,
-    F: FnOnce() -> Result<T, String> + Send + 'static,
+    E: From<String> + Send + 'static,
+    F: FnOnce() -> Result<T, E> + Send + 'static,
 {
     tokio::task::spawn_blocking(f)
         .await
-        .map_err(|e| format!("Plugin task failed: {e}"))?
+        .map_err(|e| E::from(format!("Plugin task failed: {e}")))?
 }
 
 #[tauri::command]
-pub async fn list_installed_plugins(app: PluginApp) -> Result<Vec<PluginEntry>, String> {
+pub async fn list_installed_plugins(app: PluginApp) -> Result<Vec<PluginEntry>, PluginReadError> {
     blocking(move || plugin_manager::list_installed(app)).await
 }
 
 #[tauri::command]
-pub async fn list_plugin_catalog(app: PluginApp) -> Result<Vec<PluginEntry>, String> {
+pub async fn list_plugin_catalog(app: PluginApp) -> Result<Vec<PluginEntry>, PluginReadError> {
     blocking(move || plugin_manager::list_catalog(app)).await
 }
 
 #[tauri::command]
-pub async fn list_plugin_marketplaces(app: PluginApp) -> Result<Vec<PluginMarketplace>, String> {
+pub async fn list_plugin_marketplaces(
+    app: PluginApp,
+) -> Result<Vec<PluginMarketplace>, PluginReadError> {
     blocking(move || plugin_manager::list_marketplaces(app)).await
 }
 

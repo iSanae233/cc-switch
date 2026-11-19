@@ -292,6 +292,8 @@ fn cli_context(app: PluginApp) -> (Vec<(&'static str, String)>, PathBuf) {
 }
 
 struct CliOutput {
+    executable: Option<PathBuf>,
+    exit_code: Option<i32>,
     success: bool,
     stdout: String,
     stderr: String,
@@ -300,7 +302,7 @@ struct CliOutput {
 fn run_cli(app: PluginApp, args: &[&str], timeout: Duration) -> Result<CliOutput, String> {
     let tool = app.tool();
     let (env, working_dir) = cli_context(app);
-    let output = crate::commands::run_detected_tool_command_with_timeout(
+    let (output, executable) = crate::commands::run_detected_tool_command_with_path(
         tool,
         args,
         Some(timeout),
@@ -319,6 +321,8 @@ fn run_cli(app: PluginApp, args: &[&str], timeout: Duration) -> Result<CliOutput
         return Err(CLI_NOT_INSTALLED.to_string());
     }
     Ok(CliOutput {
+        executable,
+        exit_code: output.status.code(),
         success: output.status.success(),
         stdout: crate::commands::decode_command_output(&output.stdout),
         stderr: crate::commands::decode_command_output(&output.stderr),
@@ -743,6 +747,51 @@ fn codex_plugin_enabled_patch(id: &str, enabled: bool) -> TomlPatch {
 
 // ───────────────────────────── 对外接口 ─────────────────────────────
 
+#[derive(Debug, serde::Serialize)]
+#[serde(untagged)]
+pub enum PluginReadError {
+    Message(String),
+    Cli {
+        #[serde(rename = "missingCodexDependency")]
+        missing_codex_dependency: bool,
+        message: String,
+        executable: Option<String>,
+        #[serde(rename = "exitCode")]
+        exit_code: Option<i32>,
+    },
+}
+
+impl From<String> for PluginReadError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl PluginReadError {
+    fn cli(app: PluginApp, out: &CliOutput) -> Self {
+        let missing_codex_dependency = app == PluginApp::Codex
+            && out.stderr.lines().any(|line| {
+                line.trim()
+                    .starts_with("Error: Missing optional dependency @openai/codex-")
+            });
+        Self::Cli {
+            missing_codex_dependency,
+            message: failure_detail(out),
+            executable: out
+                .executable
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            exit_code: out.exit_code,
+        }
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            Self::Message(message) | Self::Cli { message, .. } => message,
+        }
+    }
+}
+
 /// 跑一条输出 JSON 的命令，失败时返回 CLI 的报错。
 fn run_json(app: PluginApp, args: &[&str], timeout: Duration) -> Result<Value, String> {
     let out = run_cli(app, args, timeout)?;
@@ -754,13 +803,18 @@ fn run_json(app: PluginApp, args: &[&str], timeout: Duration) -> Result<Value, S
 }
 
 /// `plugin list [--available] --json`（Claude Code、Codex、MiniMax Code、Grok Build 都是这条）。
-fn run_list(app: PluginApp, with_catalog: bool) -> Result<PluginListing, String> {
+fn run_list(app: PluginApp, with_catalog: bool) -> Result<PluginListing, PluginReadError> {
     let args: &[&str] = if with_catalog {
         &["plugin", "list", "--available", "--json"]
     } else {
         &["plugin", "list", "--json"]
     };
-    let value = run_json(app, args, LIST_TIMEOUT)?;
+    let out = run_cli(app, args, LIST_TIMEOUT)?;
+    if !out.success {
+        return Err(PluginReadError::cli(app, &out));
+    }
+    let value = parse_json_payload(&out.stdout)
+        .ok_or_else(|| format!("Unexpected output from `{} {}`", app.tool(), args.join(" ")))?;
     Ok(match app {
         PluginApp::Claude => parse_claude_listing(&value),
         PluginApp::Codex => parse_codex_listing(&value),
@@ -768,27 +822,27 @@ fn run_list(app: PluginApp, with_catalog: bool) -> Result<PluginListing, String>
         PluginApp::Grok => grok::parse_listing(&value, &grok::read_config_text()),
         // OpenClaw、Pi 的列表命令不同，不走这里
         PluginApp::Openclaw | PluginApp::Pi => {
-            return Err(unsupported(app, "plugin list --available"))
+            return Err(unsupported(app, "plugin list --available").into())
         }
     })
 }
 
 /// 已安装的插件。不带 `--available`，CLI 不用展开整份市场目录（Claude Code 的官方目录有
 /// 几千项），每次启停、安装后的刷新都走这条便宜的路。
-pub fn list_installed(app: PluginApp) -> Result<Vec<PluginEntry>, String> {
+pub fn list_installed(app: PluginApp) -> Result<Vec<PluginEntry>, PluginReadError> {
     match app {
-        PluginApp::Openclaw => openclaw::list_installed(),
-        PluginApp::Pi => pi::list_installed(),
+        PluginApp::Openclaw => openclaw::list_installed().map_err(Into::into),
+        PluginApp::Pi => pi::list_installed().map_err(Into::into),
         _ => run_list(app, false).map(|listing| listing.installed),
     }
 }
 
 /// 所有市场里的插件（含已安装的，那几项按目录条目给出：未安装、未启用）。
 /// 目录只在市场增删、刷新时变，前端用「目录 − 已安装」得到「发现」，装、卸都不用重读它。
-pub fn list_catalog(app: PluginApp) -> Result<Vec<PluginEntry>, String> {
+pub fn list_catalog(app: PluginApp) -> Result<Vec<PluginEntry>, PluginReadError> {
     match app {
-        PluginApp::Openclaw => openclaw::list_catalog(),
-        PluginApp::Pi => pi::list_catalog(),
+        PluginApp::Openclaw => openclaw::list_catalog().map_err(Into::into),
+        PluginApp::Pi => pi::list_catalog().map_err(Into::into),
         _ => run_list(app, true).map(catalog_from_listing),
     }
 }
@@ -818,10 +872,10 @@ fn catalog_from_listing(listing: PluginListing) -> Vec<PluginEntry> {
     catalog
 }
 
-pub fn list_marketplaces(app: PluginApp) -> Result<Vec<PluginMarketplace>, String> {
+pub fn list_marketplaces(app: PluginApp) -> Result<Vec<PluginMarketplace>, PluginReadError> {
     // MiniMax Code 正式版禁用了市场管理；OpenClaw、Pi 没有可增删的市场。
     if matches!(app, PluginApp::Mcode | PluginApp::Openclaw | PluginApp::Pi) {
-        return Err(unsupported(app, "marketplace management"));
+        return Err(unsupported(app, "marketplace management").into());
     }
     let out = run_cli(
         app,
@@ -829,7 +883,7 @@ pub fn list_marketplaces(app: PluginApp) -> Result<Vec<PluginMarketplace>, Strin
         LIST_TIMEOUT,
     )?;
     if !out.success {
-        return Err(failure_detail(&out));
+        return Err(PluginReadError::cli(app, &out));
     }
     let value = parse_json_payload(&out.stdout).unwrap_or(Value::Null);
     Ok(match app {
@@ -1154,7 +1208,7 @@ fn refresh_each(
     app: PluginApp,
     refresh: impl Fn(&str) -> Result<(), String>,
 ) -> Result<PluginActionOutcome, String> {
-    let markets = list_marketplaces(app)?;
+    let markets = list_marketplaces(app).map_err(PluginReadError::into_message)?;
     let failures: Vec<String> = markets
         .iter()
         .filter_map(|market| {
@@ -1537,6 +1591,8 @@ enabled = false
     #[test]
     fn failure_detail_strips_noise() {
         let out = CliOutput {
+            executable: None,
+            exit_code: None,
             success: false,
             stdout: String::new(),
             stderr: "WARNING: proceeding\nError: plugin `nope` was not found\n".into(),
@@ -1546,10 +1602,32 @@ enabled = false
 
     fn failed_with_stderr(stderr: String) -> CliOutput {
         CliOutput {
+            executable: None,
+            exit_code: None,
             success: false,
             stdout: String::new(),
             stderr,
         }
+    }
+
+    #[test]
+    fn plugin_read_error_reports_the_actual_codex_launcher() {
+        let out = CliOutput {
+            executable: Some("/opt/homebrew/bin/codex".into()),
+            exit_code: Some(1),
+            ..failed_with_stderr(
+                "Error: Missing optional dependency @openai/codex-darwin-arm64. Reinstall Codex\n"
+                    .into(),
+            )
+        };
+        let error = serde_json::to_value(PluginReadError::cli(PluginApp::Codex, &out)).unwrap();
+        assert_eq!(error["executable"], "/opt/homebrew/bin/codex");
+        assert_eq!(error["exitCode"], 1);
+        assert_eq!(error["missingCodexDependency"], true);
+        let transient = failed_with_stderr("Error: network unavailable".into());
+        let error =
+            serde_json::to_value(PluginReadError::cli(PluginApp::Codex, &transient)).unwrap();
+        assert_eq!(error["missingCodexDependency"], false);
     }
 
     /// Pi 1.5.2 在 Node 22.12 上崩溃时的 stderr 形状：出错那行是整段压缩源码（实测约 118 KB）。
@@ -1605,6 +1683,8 @@ enabled = false
     #[test]
     fn claude_failed_outcome_uses_message() {
         let out = CliOutput {
+            executable: None,
+            exit_code: None,
             success: false,
             stdout: "{\"outcome\":\"failed\",\"message\":\"Plugin not found\"}\n".into(),
             stderr: "✘ Failed".into(),

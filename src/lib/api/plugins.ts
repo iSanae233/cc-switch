@@ -98,6 +98,30 @@ export const PLUGIN_LOGIN_COMMAND: Partial<Record<PluginApp, string>> = {
   mcode: "mcode login",
 };
 
+export interface PluginCliReadError {
+  missingCodexDependency: boolean;
+  message: string;
+  executable: string | null;
+  exitCode: number | null;
+}
+
+export function isPluginCliReadError(
+  error: unknown,
+): error is PluginCliReadError {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "missingCodexDependency" in error &&
+    typeof error.missingCodexDependency === "boolean" &&
+    "message" in error &&
+    typeof error.message === "string" &&
+    "executable" in error &&
+    (error.executable === null || typeof error.executable === "string") &&
+    "exitCode" in error &&
+    (error.exitCode === null || typeof error.exitCode === "number")
+  );
+}
+
 export interface PluginEntry {
   /** 交给 CLI 的 id：多数应用是 `name@marketplace`，Grok Build 是插件名，OpenClaw 是插件 id 或 ClawHub 包名，Pi 是包来源（`npm:<包名>`） */
   id: string;
